@@ -24,6 +24,9 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # opcional: fixar órgão/sub (já tem defaults)
+          DOU_ORG: "Ministério da Justiça e Segurança Pública"
+          DOU_ORG_SUB: "Polícia Federal"
         run: python main.py
 
       - name: Upload artifact (JSON do dia)
