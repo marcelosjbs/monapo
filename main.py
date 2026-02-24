@@ -4,26 +4,38 @@ import re
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from urllib.parse import urlencode
 
 import requests
 
 BASE = "https://www.in.gov.br"
 LEITURAJORNAL = BASE + "/leiturajornal"
+
 ARTIGO_PREFIXES = [
     BASE + "/en/web/dou/-/",
     BASE + "/web/dou/-/",
 ]
 
-# SIAPE: aceita nº / no / n° (°)
+# Aceita nº / no / n° (°)
 RE_SIAPE = re.compile(r"matr[ií]cula\s+SIAPE\s+n[ºo°]\s*([\d\.]+)", re.IGNORECASE)
-
-# Nome típico do DOU: "NOME, matrícula SIAPE ..."
 RE_NOME = re.compile(
     r"\b([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-ZÁÀÂÃÉÊÍÓÔÕÚÇ\s]+?)\s*,\s*matr[ií]cula\s+SIAPE\b",
     re.IGNORECASE,
 )
 
-# filtros do seu caso
+# Captura urlTitle dentro do jsonArray (quando existe)
+RE_JSON_SCRIPT = re.compile(
+    r'<script[^>]+type="application/json"[^>]*>\s*(\{.*?\})\s*</script>',
+    re.DOTALL
+)
+
+# Fallback: captura links diretos de artigo no HTML
+RE_LINK_ARTIGO = re.compile(r'href="(/(?:en/)?web/dou/-/[^"]+)"', re.IGNORECASE)
+
+# Detecta paginação
+RE_HAS_NEXT = re.compile(r'Próximo\s*&gt;&gt;|Próximo\s*»|Próximo\s*>>', re.IGNORECASE)
+
+# Filtros “PF/MJSP” para reduzir varredura
 NEEDLE_ITEM_ANY = [
     "polícia federal",
     "dgp/pf",
@@ -70,21 +82,6 @@ def http_get(session: requests.Session, url: str, timeout=40) -> str:
             time.sleep(1.2 + attempt * 1.0)
     raise last_err
 
-def extract_json_array_from_leiturajornal(html: str):
-    # <script type="application/json">{... "jsonArray":[...] ...}</script>
-    m = re.search(
-        r'<script[^>]+type="application/json"[^>]*>\s*(\{.*?\})\s*</script>',
-        html, re.DOTALL
-    )
-    if not m:
-        return []
-    try:
-        data = json.loads(m.group(1))
-        arr = data.get("jsonArray", [])
-        return arr if isinstance(arr, list) else []
-    except Exception:
-        return []
-
 def clean_text(html: str) -> str:
     html = re.sub(r"<script.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
     html = re.sub(r"<style.*?</style>", " ", html, flags=re.DOTALL | re.IGNORECASE)
@@ -101,14 +98,93 @@ def dedupe(seq):
         out.append(x)
     return out
 
+def extract_json_array(html: str):
+    m = RE_JSON_SCRIPT.search(html)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(1))
+        arr = data.get("jsonArray", [])
+        return arr if isinstance(arr, list) else []
+    except Exception:
+        return []
+
 def item_matches_pf(item: dict) -> bool:
-    # sem depender de campo fixo: transforma o item inteiro em texto e procura termos
     blob = json.dumps(item, ensure_ascii=False).lower()
     return any(k in blob for k in NEEDLE_ITEM_ANY)
 
-def fetch_article(session: requests.Session, url_title: str):
+def build_leiturajornal_url(date_str: str, page: int, org: str | None, org_sub: str | None) -> str:
+    params = {"secao": "dou2", "data": date_str}
+    # Se você quiser manter filtro por órgão/subórgão, deixe setado.
+    # Mas se ele esconder itens, desative (org=None/org_sub=None).
+    if org:
+        params["org"] = org
+    if org_sub:
+        params["org_sub"] = org_sub
+    # parâmetro de paginação (na prática costuma ser "pagina")
+    params["pagina"] = str(page)
+    return f"{LEITURAJORNAL}?{urlencode(params)}"
+
+def fetch_all_targets(session: requests.Session, date_str: str, org: str | None, org_sub: str | None, max_pages: int = 60):
+    """
+    Busca todas as páginas do leiturajornal (paginado) e retorna:
+    - urlTitles (quando houver jsonArray)
+    - ou links /web/dou/-/... (fallback)
+    """
+    all_targets = []
+    mode_used = None
+
+    for page in range(1, max_pages + 1):
+        url = build_leiturajornal_url(date_str, page, org, org_sub)
+        print(f"[INFO] Página {page}: {url}")
+
+        html = http_get(session, url)
+
+        items = extract_json_array(html)
+        if items:
+            mode_used = mode_used or "jsonArray"
+            url_titles = []
+            for it in items:
+                if isinstance(it, dict) and it.get("urlTitle") and item_matches_pf(it):
+                    url_titles.append(it["urlTitle"])
+            url_titles = dedupe(url_titles)
+            all_targets.extend(url_titles)
+        else:
+            # fallback por links do HTML (sem metadata do item)
+            mode_used = mode_used or "html_links"
+            links = RE_LINK_ARTIGO.findall(html)
+            links = dedupe(links)
+            all_targets.extend(links)
+
+        # condição de parada: se não tiver “Próximo” e já passamos da 1ª página
+        has_next = bool(RE_HAS_NEXT.search(html))
+        if not has_next:
+            print(f"[INFO] Sem 'Próximo' na página {page}. Parando.")
+            break
+
+        # pausa pequena para não tomar rate-limit
+        time.sleep(0.4)
+
+    return dedupe(all_targets), (mode_used or "unknown")
+
+def fetch_article(session: requests.Session, target: str):
+    """
+    target pode ser:
+    - urlTitle (sem barras)
+    - path "/en/web/dou/-/..." ou "/web/dou/-/..."
+    - URL completa
+    """
+    if target.startswith("http"):
+        html = http_get(session, target)
+        return target, clean_text(html)
+
+    if target.startswith("/"):
+        url = BASE + target
+        html = http_get(session, url)
+        return url, clean_text(html)
+
     for prefix in ARTIGO_PREFIXES:
-        url = prefix + url_title
+        url = prefix + target
         try:
             html = http_get(session, url)
             return url, clean_text(html)
@@ -149,35 +225,20 @@ def telegram_send(text: str):
 
 def main():
     date_str = os.getenv("DOU_DATE") or br_today_str()
-
     session = get_session()
 
-    # IMPORTANTÍSSIMO: NÃO usar org/org_sub aqui — pega a seção inteira do dia.
-    jornal_url = f"{LEITURAJORNAL}?secao=dou2&data={date_str}"
-    print(f"[INFO] leiturajornal: {jornal_url}")
+    # Recomendo NÃO usar org/org_sub aqui (às vezes omite páginas/itens).
+    # Se você quiser insistir, defina DOU_ORG e DOU_ORG_SUB.
+    org = os.getenv("DOU_ORG")  # ex: "Ministério da Justiça e Segurança Pública"
+    org_sub = os.getenv("DOU_ORG_SUB")  # ex: "Polícia Federal"
 
-    html = http_get(session, jornal_url)
-    items = extract_json_array_from_leiturajornal(html)
-    print(f"[INFO] jsonArray itens: {len(items)}")
-
-    url_titles = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        if not it.get("urlTitle"):
-            continue
-        # pré-filtro por PF/MJSP no item
-        if item_matches_pf(it):
-            url_titles.append(it["urlTitle"])
-
-    url_titles = dedupe(url_titles)
-    print(f"[INFO] candidatos PF/MJSP: {len(url_titles)}")
+    targets, mode = fetch_all_targets(session, date_str, org, org_sub)
+    print(f"[INFO] Targets encontrados ({mode}): {len(targets)}")
 
     results = []
     scanned = 0
-
-    for ut in url_titles:
-        url_used, text = fetch_article(session, ut)
+    for t in targets:
+        url_used, text = fetch_article(session, t)
         if not url_used or not text:
             continue
         scanned += 1
@@ -188,10 +249,11 @@ def main():
     payload = {
         "data": date_str,
         "secao": "dou2",
+        "mode": mode,
+        "targets": len(targets),
+        "scanned_articles": scanned,
         "total": len(results),
         "resultados": results,
-        "scanned_articles": scanned,
-        "source": jornal_url,
     }
 
     out = f"saida_{date_str.replace('-', '')}.json"
@@ -201,10 +263,12 @@ def main():
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
     if results:
-        msg = [f"DOU Seção 2 ({date_str}) — Aposentadoria(s) PF (Perito Criminal Federal):"]
+        linhas = [f"DOU Seção 2 ({date_str}) — Aposentadoria(s) Perito Criminal Federal:"]
         for r in results:
-            msg.append(f"- {r.get('nome')} | SIAPE: {r.get('siape')} | {r.get('url')}")
-        telegram_send("\n".join(msg))
+            nome = r.get("nome") or "(nome não extraído)"
+            siape = r.get("siape") or "(SIAPE não extraído)"
+            linhas.append(f"- {nome} | SIAPE: {siape} | {r.get('url')}")
+        telegram_send("\n".join(linhas))
 
 if __name__ == "__main__":
     main()
