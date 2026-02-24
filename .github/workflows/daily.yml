@@ -1,0 +1,27 @@
+name: DOU Perito PF (diario)
+
+on:
+  schedule:
+    # 11:10 UTC = 08:10 Brasilia (UTC-3)
+    - cron: "10 11 * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run
+        run: python main.py
+
+      - name: Upload artifact (JSON do dia)
+        uses: actions/upload-artifact@v4
+        with:
+          name: saida
+          path: saida_*.json
