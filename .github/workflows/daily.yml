@@ -2,7 +2,7 @@ name: DOU Perito PF (diario)
 
 on:
   schedule:
-    - cron: "10 11 * * *"  # 08:10 BRT
+    - cron: "10 11 * * *"  # 08:10 BRT (UTC-3)
   workflow_dispatch:
 
 jobs:
@@ -17,7 +17,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install requests
+        run: |
+          pip install requests playwright
+          python -m playwright install --with-deps chromium
 
       - name: Run
         env:
